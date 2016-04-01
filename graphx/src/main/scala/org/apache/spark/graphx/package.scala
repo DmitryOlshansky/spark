@@ -17,7 +17,7 @@
 
 package org.apache.spark
 
-import org.apache.spark.util.collection.OpenHashSet
+import org.apache.spark.util.collection.SparseBitSet
 
 /**
  * <span class="badge" style="float: right;">ALPHA COMPONENT</span>
@@ -34,5 +34,5 @@ package object graphx {
   // TODO: Consider using Char.
   type PartitionID = Int
 
-  private[graphx] type VertexSet = OpenHashSet[VertexId]
+  private[graphx] type VertexSet = SparseBitSet
 }

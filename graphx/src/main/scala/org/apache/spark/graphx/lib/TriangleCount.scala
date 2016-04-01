@@ -20,7 +20,6 @@ package org.apache.spark.graphx.lib
 import scala.reflect.ClassTag
 
 import org.apache.spark.graphx._
-import org.apache.spark.util.collection.SparseBitSet
 
 /**
  * Compute the number of triangles passing through each vertex.
@@ -66,11 +65,11 @@ object TriangleCount {
 
   def runPreCanonicalized[VD: ClassTag, ED: ClassTag](graph: Graph[VD, ED]): Graph[Int, ED] = {
     // Construct set representations of the neighborhoods
-    val nbrSets: VertexRDD[SparseBitSet] =
+    val nbrSets: VertexRDD[VertexSet] =
       graph.collectNeighborIds(EdgeDirection.Either).mapValues { (vid, nbrs) =>
         val pow = 32 - Integer.numberOfLeadingZeros(nbrs.length)
         val size = if (pow > 2) 1<<(pow-1) else 4
-        val set = new SparseBitSet(size)
+        val set = new VertexSet(size)
         var i = 0
         while (i < nbrs.length) {
           // prevent self cycle
@@ -83,12 +82,12 @@ object TriangleCount {
       }
 
     // join the sets with the graph
-    val setGraph: Graph[SparseBitSet, ED] = graph.outerJoinVertices(nbrSets) {
+    val setGraph: Graph[VertexSet, ED] = graph.outerJoinVertices(nbrSets) {
       (vid, _, optSet) => optSet.getOrElse(null)
     }
 
     // Edge function computes intersection of smaller vertex with larger vertex
-    def edgeFunc(ctx: EdgeContext[SparseBitSet, ED, Int]) {
+    def edgeFunc(ctx: EdgeContext[VertexSet, ED, Int]) {
       val counter = ctx.srcAttr.intersectionSize(ctx.dstAttr, ctx.dstId, ctx.srcId)
       ctx.sendToSrc(counter)
       ctx.sendToDst(counter)
