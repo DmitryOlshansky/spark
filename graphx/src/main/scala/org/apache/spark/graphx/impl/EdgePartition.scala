@@ -75,7 +75,7 @@ class EdgePartition[
 
   /** Return a new `EdgePartition` with the specified active set, provided as an iterator. */
   def withActiveSet(iter: Iterator[VertexId]): EdgePartition[ED, VD] = {
-    val activeSet = new VertexSet
+    val activeSet = new VertexSet(4)
     while (iter.hasNext) { activeSet.add(iter.next()) }
     new EdgePartition(
       localSrcIds, localDstIds, data, index, global2local, local2global, vertexAttrs,
