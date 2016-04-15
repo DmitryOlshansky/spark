@@ -17,6 +17,8 @@
 
 package org.apache.spark.graphx.impl
 
+import java.util.Arrays
+
 import scala.reflect.ClassTag
 
 import org.apache.spark.graphx._

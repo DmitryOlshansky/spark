@@ -94,7 +94,8 @@ object TriangleCount {
     }
 
     // compute the intersection along edges
-    val counters: VertexRDD[Int] = setGraph.aggregateMessages(edgeFunc, _ + _)
+    val counters: VertexRDD[Int] = setGraph.aggregateMessages(edgeFunc, _ + _,
+      new TripletFields(true, true, false))
     // Merge counters with the graph and divide by two since each triangle is counted twice
     graph.outerJoinVertices(counters) { (_, _, optCounter: Option[Int]) =>
       val dblCount = optCounter.getOrElse(0)

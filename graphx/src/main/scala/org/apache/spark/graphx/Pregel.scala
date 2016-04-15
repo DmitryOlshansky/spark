@@ -134,6 +134,7 @@ object Pregel extends Logging {
       prevG = g
       g = g.joinVertices(messages)(vprog).cache()
 
+
       val oldMessages = messages
       // Send new messages, skipping edges where neither side received a message. We must cache
       // messages so it can be materialized on the next line, allowing us to uncache the previous
