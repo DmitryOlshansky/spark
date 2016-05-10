@@ -61,3 +61,8 @@ if [ -z "$SPARK_SCALA_VERSION" ]; then
     export SPARK_SCALA_VERSION="2.10"
   fi
 fi
+export JAVA_HOME=$HOME/jdk1.8.0_73
+SPARK_DAEMON_JAVA_OPTS+="-agentlib:hprof"
+export SPARK_DAEMON_JAVA_OPTS
+SPARK_JAVA_OPTS+="-agentlib:hprof=cpu=samples"
+export SPARK_JAVA_OPTS

@@ -122,12 +122,12 @@
 #*.sink.jmx.class=org.apache.spark.metrics.sink.JmxSink
 
 # Enable ConsoleSink for all instances by class name
-#*.sink.console.class=org.apache.spark.metrics.sink.ConsoleSink
+*.sink.console.class=org.apache.spark.metrics.sink.ConsoleSink
 
 # Polling period for the ConsoleSink
-#*.sink.console.period=10
+*.sink.console.period=10
 # Unit of the polling period for the ConsoleSink
-#*.sink.console.unit=seconds
+*.sink.console.unit=seconds
 
 # Polling period for the ConsoleSink specific for the master instance
 #master.sink.console.period=15

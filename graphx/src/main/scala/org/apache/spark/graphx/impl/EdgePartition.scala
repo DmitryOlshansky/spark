@@ -23,6 +23,35 @@ import org.apache.spark.graphx._
 import org.apache.spark.graphx.util.collection.GraphXPrimitiveKeyOpenHashMap
 import org.apache.spark.util.collection.BitSet
 
+// Using protobuf style packing of integers + delta-encoding
+class PackedInts(val tab: Array[Byte], val length: Int) extends Iterable[Int] with Serializable{
+  class Iter(start: Int, var last: Int) extends Iterator[Int]{
+    var offset = start
+
+    override def hasNext: Boolean = offset < tab.length
+
+    override def next(): Int = {
+      var accum = 0
+      var shift = 0
+      while((tab(offset) & 0x80) != 0) {
+        accum |= (tab(offset) & 0x7F) << shift
+        shift += 7
+        offset += 1
+      }
+      accum |= (tab(offset) & 0x7F)<<shift
+      // decode zig-zag
+      accum = (accum >>> 1) ^ -(accum & 1)
+      offset += 1
+      val v = accum + last
+      last = v
+      v
+    }
+  }
+  def iterator: Iter = new Iter(0, 0)
+
+  def iteratorAt(ofs: (Int,Int)): Iter = new Iter(ofs._1, ofs._2)
+}
+
 /**
  * A collection of edges, along with referenced vertex attributes and an optional active vertex set
  * for filtering computation on the edges.
@@ -38,11 +67,10 @@ import org.apache.spark.util.collection.BitSet
  *
  * @tparam ED the edge attribute type
  * @tparam VD the vertex attribute type
- *
- * @param localSrcIds the local source vertex id of each edge as an index into `local2global` and
- *   `vertexAttrs`
- * @param localDstIds the local destination vertex id of each edge as an index into `local2global`
- *   and `vertexAttrs`
+ * @param localSrcIds the local source vertex id pairs of each
+ *                       edge as an index into `local2global` and `vertexAttrs`
+ * @param localDstIds the local destination vertex id pairs of each
+ *                       edge as an index into `local2global` and `vertexAttrs`
  * @param data the attribute associated with each edge
  * @param index a clustered index on source vertex id as a map from each global source vertex id to
  *   the offset in the edge arrays where the cluster for that vertex id begins
@@ -54,14 +82,14 @@ import org.apache.spark.util.collection.BitSet
 private[graphx]
 class EdgePartition[
     @specialized(Char, Int, Boolean, Byte, Long, Float, Double) ED: ClassTag, VD: ClassTag](
-    localSrcIds: Array[Int],
-    localDstIds: Array[Int],
-    data: Array[ED],
-    index: GraphXPrimitiveKeyOpenHashMap[VertexId, Int],
-    global2local: GraphXPrimitiveKeyOpenHashMap[VertexId, Int],
-    local2global: Array[VertexId],
-    vertexAttrs: Array[VD],
-    activeSet: Option[VertexSet])
+    val localSrcIds: PackedInts,
+    val localDstIds: PackedInts,
+    val data: Array[ED],
+    val index: GraphXPrimitiveKeyOpenHashMap[VertexId, (Int, Int, Int, Int, Int)],
+    val global2local: GraphXPrimitiveKeyOpenHashMap[VertexId, Int],
+    val local2global: Array[VertexId],
+    val vertexAttrs: Array[VD],
+    val activeSet: Option[VertexSet])
   extends Serializable {
 
   /** No-arg constructor for serialization. */
@@ -70,7 +98,8 @@ class EdgePartition[
   /** Return a new `EdgePartition` with the specified edge data. */
   def withData[ED2: ClassTag](data: Array[ED2]): EdgePartition[ED2, VD] = {
     new EdgePartition(
-      localSrcIds, localDstIds, data, index, global2local, local2global, vertexAttrs, activeSet)
+      localSrcIds, localDstIds, data,
+      index, global2local, local2global, vertexAttrs, activeSet)
   }
 
   /** Return a new `EdgePartition` with the specified active set, provided as an iterator. */
@@ -78,8 +107,8 @@ class EdgePartition[
     val activeSet = new VertexSet(4)
     while (iter.hasNext) { activeSet.add(iter.next()) }
     new EdgePartition(
-      localSrcIds, localDstIds, data, index, global2local, local2global, vertexAttrs,
-      Some(activeSet))
+      localSrcIds, localDstIds, data,
+      index, global2local, local2global, vertexAttrs, Some(activeSet))
   }
 
   /** Return a new `EdgePartition` with updates to vertex attributes specified in `iter`. */
@@ -91,7 +120,8 @@ class EdgePartition[
       newVertexAttrs(global2local(kv._1)) = kv._2
     }
     new EdgePartition(
-      localSrcIds, localDstIds, data, index, global2local, local2global, newVertexAttrs,
+      localSrcIds, localDstIds, data,
+      index, global2local, local2global, newVertexAttrs,
       activeSet)
   }
 
@@ -99,15 +129,10 @@ class EdgePartition[
   def withoutVertexAttributes[VD2: ClassTag](): EdgePartition[ED, VD2] = {
     val newVertexAttrs = new Array[VD2](vertexAttrs.length)
     new EdgePartition(
-      localSrcIds, localDstIds, data, index, global2local, local2global, newVertexAttrs,
+      localSrcIds, localDstIds, data,
+      index, global2local, local2global, newVertexAttrs,
       activeSet)
   }
-
-  @inline private def srcIds(pos: Int): VertexId = local2global(localSrcIds(pos))
-
-  @inline private def dstIds(pos: Int): VertexId = local2global(localDstIds(pos))
-
-  @inline private def attrs(pos: Int): ED = data(pos)
 
   /** Look up vid in activeSet, throwing an exception if it is None. */
   def isActive(vid: VertexId): Boolean = {
@@ -125,15 +150,17 @@ class EdgePartition[
   def reverse: EdgePartition[ED, VD] = {
     val builder = new ExistingEdgePartitionBuilder[ED, VD](
       global2local, local2global, vertexAttrs, activeSet, size)
-    var i = 0
-    while (i < size) {
-      val localSrcId = localSrcIds(i)
-      val localDstId = localDstIds(i)
+    val i = localSrcIds.iterator
+    val j = localDstIds.iterator
+    var k = 0
+    while (i.hasNext) {
+      val localSrcId = i.next()
+      val localDstId = j.next()
       val srcId = local2global(localSrcId)
       val dstId = local2global(localDstId)
-      val attr = data(i)
+      val attr = data(k)
       builder.add(dstId, srcId, localDstId, localSrcId, attr)
-      i += 1
+      k += 1
     }
     builder.toEdgePartition
   }
@@ -153,14 +180,15 @@ class EdgePartition[
   def map[ED2: ClassTag](f: Edge[ED] => ED2): EdgePartition[ED2, VD] = {
     val newData = new Array[ED2](data.length)
     val edge = new Edge[ED]()
-    val size = data.length
-    var i = 0
-    while (i < size) {
-      edge.srcId = srcIds(i)
-      edge.dstId = dstIds(i)
-      edge.attr = data(i)
-      newData(i) = f(edge)
-      i += 1
+    val i = localSrcIds.iterator
+    val j = localDstIds.iterator
+    var k = 0
+    while (i.hasNext) {
+      edge.srcId = i.next()
+      edge.dstId = j.next()
+      edge.attr = data(k)
+      newData(k) = f(edge)
+      k += 1
     }
     this.withData(newData)
   }
@@ -173,7 +201,7 @@ class EdgePartition[
    * order of the edges returned by `EdgePartition.iterator` and
    * should return attributes equal to the number of edges.
    *
-   * @param iter an iterator for the new attribute values
+    * @param iter an iterator for the new attribute values
    * @tparam ED2 the type of the new attribute
    * @return a new edge partition with the attribute values replaced
    */
@@ -198,21 +226,23 @@ class EdgePartition[
       vpred: (VertexId, VD) => Boolean): EdgePartition[ED, VD] = {
     val builder = new ExistingEdgePartitionBuilder[ED, VD](
       global2local, local2global, vertexAttrs, activeSet)
-    var i = 0
-    while (i < size) {
+    var k = 0
+    val i = localSrcIds.iterator
+    val j = localDstIds.iterator
+    while (i.hasNext) {
       // The user sees the EdgeTriplet, so we can't reuse it and must create one per edge.
-      val localSrcId = localSrcIds(i)
-      val localDstId = localDstIds(i)
+      val localSrcId = i.next()
+      val localDstId = j.next()
       val et = new EdgeTriplet[VD, ED]
       et.srcId = local2global(localSrcId)
       et.dstId = local2global(localDstId)
       et.srcAttr = vertexAttrs(localSrcId)
       et.dstAttr = vertexAttrs(localDstId)
-      et.attr = data(i)
+      et.attr = data(k)
       if (vpred(et.srcId, et.srcAttr) && vpred(et.dstId, et.dstAttr) && epred(et)) {
         builder.add(et.srcId, et.dstId, localSrcId, localDstId, et.attr)
       }
-      i += 1
+      k += 1
     }
     builder.toEdgePartition
   }
@@ -243,25 +273,31 @@ class EdgePartition[
     var currAttr: ED = null.asInstanceOf[ED]
     // Iterate through the edges, accumulating runs of identical edges using the curr* variables and
     // releasing them to the builder when we see the beginning of the next run
-    var i = 0
-    while (i < size) {
-      if (i > 0 && currSrcId == srcIds(i) && currDstId == dstIds(i)) {
+    var k = 0
+    val i = localSrcIds.iterator
+    val j = localDstIds.iterator
+    while (k < size) {
+      val localSrcId = i.next()
+      val localDstId = j.next()
+      val srcId = local2global(localSrcId)
+      val dstId = local2global(localDstId)
+      if (k > 0 && currSrcId == srcId && currDstId == dstId) {
         // This edge should be accumulated into the existing run
-        currAttr = merge(currAttr, data(i))
+        currAttr = merge(currAttr, data(k))
       } else {
         // This edge starts a new run of edges
-        if (i > 0) {
+        if (k > 0) {
           // First release the existing run to the builder
           builder.add(currSrcId, currDstId, currLocalSrcId, currLocalDstId, currAttr)
         }
         // Then start accumulating for a new run
-        currSrcId = srcIds(i)
-        currDstId = dstIds(i)
-        currLocalSrcId = localSrcIds(i)
-        currLocalDstId = localDstIds(i)
-        currAttr = data(i)
+        currSrcId = srcId
+        currDstId = dstId
+        currLocalSrcId = localSrcId
+        currLocalDstId = localDstId
+        currAttr = data(k)
       }
-      i += 1
+      k += 1
     }
     // Finally, release the last accumulated run
     if (size > 0) {
@@ -285,20 +321,39 @@ class EdgePartition[
       (f: (VertexId, VertexId, ED, ED2) => ED3): EdgePartition[ED3, VD] = {
     val builder = new ExistingEdgePartitionBuilder[ED3, VD](
       global2local, local2global, vertexAttrs, activeSet)
+    val iSrc = localSrcIds.iterator
+    val iDst = localDstIds.iterator
     var i = 0
     var j = 0
+    val jSrc = other.localSrcIds.iterator
+    val jDst = other.localDstIds.iterator
     // For i = index of each edge in `this`...
-    while (i < size && j < other.size) {
-      val srcId = this.srcIds(i)
-      val dstId = this.dstIds(i)
+    while (iSrc.hasNext) {
+      val localSrcId = iSrc.next()
+      val localDstId = iDst.next()
+      val srcId = this.local2global(localSrcId)
+      val dstId = this.local2global(localDstId)
+      var otherSrcId = 0L
+      var otherDstId = 0L
       // ... forward j to the index of the corresponding edge in `other`, and...
-      while (j < other.size && other.srcIds(j) < srcId) { j += 1 }
-      if (j < other.size && other.srcIds(j) == srcId) {
-        while (j < other.size && other.srcIds(j) == srcId && other.dstIds(j) < dstId) { j += 1 }
-        if (j < other.size && other.srcIds(j) == srcId && other.dstIds(j) == dstId) {
+      while(jSrc.hasNext &&
+        {
+          otherSrcId = other.local2global(jSrc.next())
+          otherDstId = other.local2global(jDst.next())
+          otherSrcId < srcId
+        }) {
+        j += 1
+      }
+      if (jSrc.hasNext && otherSrcId == srcId) {
+        while (jSrc.hasNext && otherSrcId == srcId && otherDstId < dstId) {
+          otherSrcId = other.local2global(jSrc.next())
+          otherDstId = other.local2global(jDst.next())
+          j += 1
+        }
+        if (jSrc.hasNext && otherSrcId == srcId && otherDstId == dstId) {
           // ... run `f` on the matching edge
-          builder.add(srcId, dstId, localSrcIds(i), localDstIds(i),
-            f(srcId, dstId, this.data(i), other.attrs(j)))
+          builder.add(srcId, dstId, localSrcId, localDstId,
+            f(srcId, dstId, this.data(i), other.data(j)))
         }
       }
       i += 1
@@ -326,13 +381,15 @@ class EdgePartition[
    */
   def iterator: Iterator[Edge[ED]] = new Iterator[Edge[ED]] {
     private[this] val edge = new Edge[ED]
+    private[this] val i = localSrcIds.iterator
+    private[this] val j = localDstIds.iterator
     private[this] var pos = 0
 
-    override def hasNext: Boolean = pos < EdgePartition.this.size
+    override def hasNext: Boolean = i.hasNext
 
     override def next(): Edge[ED] = {
-      edge.srcId = srcIds(pos)
-      edge.dstId = dstIds(pos)
+      edge.srcId = local2global(i.next())
+      edge.dstId = local2global(j.next())
       edge.attr = data(pos)
       pos += 1
       edge
@@ -347,14 +404,16 @@ class EdgePartition[
   def tripletIterator(
       includeSrc: Boolean = true, includeDst: Boolean = true)
       : Iterator[EdgeTriplet[VD, ED]] = new Iterator[EdgeTriplet[VD, ED]] {
+    private[this] val i = localSrcIds.iterator
+    private[this] val j = localDstIds.iterator
     private[this] var pos = 0
 
-    override def hasNext: Boolean = pos < EdgePartition.this.size
+    override def hasNext: Boolean = i.hasNext
 
     override def next(): EdgeTriplet[VD, ED] = {
       val triplet = new EdgeTriplet[VD, ED]
-      val localSrcId = localSrcIds(pos)
-      val localDstId = localDstIds(pos)
+      val localSrcId = i.next()
+      val localDstId = j.next()
       triplet.srcId = local2global(localSrcId)
       triplet.dstId = local2global(localDstId)
       if (includeSrc) {
@@ -378,7 +437,7 @@ class EdgePartition[
    * @param tripletFields which triplet fields `sendMsg` uses
    * @param activeness criteria for filtering edges based on activeness
    *
-   * @return iterator aggregated messages keyed by the receiving vertex id
+    * @return iterator aggregated messages keyed by the receiving vertex id
    */
   def aggregateMessagesEdgeScan[A: ClassTag](
       sendMsg: EdgeContext[VD, ED, A] => Unit,
@@ -388,12 +447,14 @@ class EdgePartition[
     val aggregates = new Array[A](vertexAttrs.length)
     val bitset = new BitSet(vertexAttrs.length)
 
-    var ctx = new AggregatingEdgeContext[VD, ED, A](mergeMsg, aggregates, bitset)
-    var i = 0
-    while (i < size) {
-      val localSrcId = localSrcIds(i)
+    val ctx = new AggregatingEdgeContext[VD, ED, A](mergeMsg, aggregates, bitset)
+    val i = localSrcIds.iterator
+    val j = localDstIds.iterator
+    var k = 0
+    while (i.hasNext) {
+      val localSrcId = i.next()
       val srcId = local2global(localSrcId)
-      val localDstId = localDstIds(i)
+      val localDstId = j.next()
       val dstId = local2global(localDstId)
       val edgeIsActive =
         if (activeness == EdgeActiveness.Neither) true
@@ -405,10 +466,10 @@ class EdgePartition[
       if (edgeIsActive) {
         val srcAttr = if (tripletFields.useSrc) vertexAttrs(localSrcId) else null.asInstanceOf[VD]
         val dstAttr = if (tripletFields.useDst) vertexAttrs(localDstId) else null.asInstanceOf[VD]
-        ctx.set(srcId, dstId, localSrcId, localDstId, srcAttr, dstAttr, data(i))
+        ctx.set(srcId, dstId, localSrcId, localDstId, srcAttr, dstAttr, data(k))
         sendMsg(ctx)
       }
-      i += 1
+      k += 1
     }
 
     bitset.iterator.map { localId => (local2global(localId), aggregates(localId)) }
@@ -423,7 +484,7 @@ class EdgePartition[
    * @param tripletFields which triplet fields `sendMsg` uses
    * @param activeness criteria for filtering edges based on activeness
    *
-   * @return iterator aggregated messages keyed by the receiving vertex id
+    * @return iterator aggregated messages keyed by the receiving vertex id
    */
   def aggregateMessagesIndexScan[A: ClassTag](
       sendMsg: EdgeContext[VD, ED, A] => Unit,
@@ -437,7 +498,7 @@ class EdgePartition[
     index.iterator.foreach { cluster =>
       val clusterSrcId = cluster._1
       val clusterPos = cluster._2
-      val clusterLocalSrcId = localSrcIds(clusterPos)
+      val clusterLocalSrcId = localSrcIds.iteratorAt(clusterPos._2, clusterPos._3).next()
 
       val scanCluster =
         if (activeness == EdgeActiveness.Neither) true
@@ -448,12 +509,14 @@ class EdgePartition[
         else throw new Exception("unreachable")
 
       if (scanCluster) {
-        var pos = clusterPos
+        var pos = clusterPos._1
+        val i = localSrcIds.iteratorAt(clusterPos._2, clusterPos._3)
+        val j = localDstIds.iteratorAt(clusterPos._4, clusterPos._5)
         val srcAttr =
           if (tripletFields.useSrc) vertexAttrs(clusterLocalSrcId) else null.asInstanceOf[VD]
         ctx.setSrcOnly(clusterSrcId, clusterLocalSrcId, srcAttr)
-        while (pos < size && localSrcIds(pos) == clusterLocalSrcId) {
-          val localDstId = localDstIds(pos)
+        while (pos < size && i.next() == clusterLocalSrcId) {
+          val localDstId = j.next()
           val dstId = local2global(localDstId)
           val edgeIsActive =
             if (activeness == EdgeActiveness.Neither) true
